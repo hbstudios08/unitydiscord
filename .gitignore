@@ -44,3 +44,13 @@
 * *.aab
 * *.unitypackage
 * *.app
+*.log
+*.bin
+*.index
+*.dll
+*.pdb
+*.json
+*.csproj
+/Library
+/UserSettings
+/obj/Debug
