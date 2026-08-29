@@ -1,18 +1,22 @@
 ﻿using System;
 using System.IO;
-using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
-using UnityEngine.Networking;
-using UnityEngine.InputSystem; // requires com.unity.inputsystem package
 using MoonSharp.Interpreter;
 
+/// <summary>
+/// Runs Lua code entirely locally on this device — no server, no polling.
+/// AIRequestClient generates new scripts by calling an AI provider directly, then
+/// hands the result to LoadAndRunGeneratedScript() below.
+/// </summary>
 public class MoonSharpOTAManager : MonoBehaviour
 {
-    [SerializeField] private string serverUrl = "https://YOUR-STATIC-DOMAIN.ngrok-free.dev/get-apk-code-update";
-    [SerializeField] private float pollInterval = 3.0f;
     [SerializeField] private Camera targetCamera; // assign in Inspector; falls back to Camera.main
     [SerializeField] private float touchWorldDistanceFromCamera = 10f; // used for perspective cameras
+
+    [Header("Offline Fallback")]
+    [Tooltip("Used ONLY when this device has never cached or generated a script of its own (e.g. very first launch with no network / before any prompt has been submitted).")]
+    [SerializeField] private TextAsset bundledFallbackScript;
 
     private Script luaScript;
     private string deviceSavePath;
@@ -22,43 +26,11 @@ public class MoonSharpOTAManager : MonoBehaviour
 
     private Dictionary<string, GameObject> spawnedObjects = new Dictionary<string, GameObject>();
     private int nextObjectId = 0;
-    private string deviceId;
-
-    /// <summary>
-    /// Stable per-device identifier used so the server can store and return a
-    /// separate script for each device instead of one shared script for everyone.
-    /// Cached in PlayerPrefs so it survives app restarts.
-    /// </summary>
-    public string DeviceId
-    {
-        get
-        {
-            if (string.IsNullOrEmpty(deviceId))
-            {
-                deviceId = PlayerPrefs.GetString("ota_device_id", "");
-                if (string.IsNullOrEmpty(deviceId))
-                {
-                    // SystemInfo.deviceUniqueIdentifier is not reliable/available on all platforms
-                    // (e.g. WebGL), so fall back to a generated GUID either way.
-                    deviceId = System.Guid.NewGuid().ToString("N");
-                    PlayerPrefs.SetString("ota_device_id", deviceId);
-                    PlayerPrefs.Save();
-                }
-            }
-            return deviceId;
-        }
-    }
-
-    private string PollUrlWithDeviceId()
-    {
-        string separator = serverUrl.Contains("?") ? "&" : "?";
-        return $"{serverUrl}{separator}deviceId={UnityWebRequest.EscapeURL(DeviceId)}";
-    }
 
     private void Start()
     {
         Screen.sleepTimeout = SleepTimeout.NeverSleep;
-        deviceSavePath = Path.Combine(Application.persistentDataPath, $"saved_logic_{DeviceId}.lua");
+        deviceSavePath = Path.Combine(Application.persistentDataPath, "saved_logic.lua");
 
         if (targetCamera == null)
         {
@@ -67,11 +39,14 @@ public class MoonSharpOTAManager : MonoBehaviour
 
         CleanBadCache();
 
-        // Load whatever is already saved offline so the game works instantly without waiting for network
-        LoadSavedScriptFromDevice();
-
-        // Kick off background polling for live updates
-        StartCoroutine(PollForOTAUpdates());
+        // Priority: 1) last successful AI-generated script cached on this device,
+        // 2) bundled offline fallback library.
+        bool loadedFromCache = LoadSavedScriptFromDevice();
+        if (!loadedFromCache && bundledFallbackScript != null)
+        {
+            Debug.Log("📦 [Offline] No cached script found — running bundled fallback script.");
+            LoadAndRunGeneratedScript(bundledFallbackScript.text, saveToDisk: false);
+        }
     }
 
     private void Update()
@@ -95,6 +70,38 @@ public class MoonSharpOTAManager : MonoBehaviour
         }
     }
 
+    /// <summary>
+    /// Entry point for AIRequestClient (or the bundled fallback) to push a new script in.
+    /// Caches it to disk (so it survives app restarts) and executes it immediately.
+    /// </summary>
+    public void LoadAndRunGeneratedScript(string luaCode, bool saveToDisk = true)
+    {
+        if (string.IsNullOrEmpty(luaCode))
+        {
+            Debug.LogWarning("⚠ [Lua] LoadAndRunGeneratedScript called with empty code. Ignored.");
+            return;
+        }
+
+        bool unchanged = luaCode == currentLoadedScript;
+        Debug.Log($"🔍 [Lua] Loading new script (unchanged from previous: {unchanged}):\n{luaCode}");
+
+        currentLoadedScript = luaCode;
+        if (saveToDisk)
+        {
+            SaveScriptToDevice(luaCode);
+        }
+        ExecuteLuaScript(luaCode);
+    }
+
+    /// <summary>
+    /// The script currently running, used as "existing code" context when asking the AI
+    /// to make an incremental change instead of starting from scratch.
+    /// </summary>
+    public string GetCurrentScript()
+    {
+        return currentLoadedScript;
+    }
+
     private void CleanBadCache()
     {
         if (File.Exists(deviceSavePath))
@@ -102,9 +109,8 @@ public class MoonSharpOTAManager : MonoBehaviour
             try
             {
                 string content = File.ReadAllText(deviceSavePath);
-                if (string.IsNullOrEmpty(content) || content.Contains("<!DOCTYPE html>") || content.Contains("<html"))
+                if (string.IsNullOrEmpty(content))
                 {
-                    Debug.LogWarning("⚠ [OTA] Detected HTML or corrupted data in local cache. Purging file.");
                     File.Delete(deviceSavePath);
                 }
             }
@@ -120,12 +126,13 @@ public class MoonSharpOTAManager : MonoBehaviour
         Script freshScript = new Script();
         Table unityTable = new Table(freshScript);
 
-        // Core API Bindings — keep this list in sync with the SYSTEM_PROMPT in server.js
+        // Core API Bindings — keep this list in sync with the SYSTEM_PROMPT in AIRequestClient.cs
         unityTable["DebugLog"] = (Action<string>)LuaDebugLog;
         unityTable["SetBackgroundColor"] = (Action<float, float, float>)LuaSetBackgroundColor;
         unityTable["SpawnObject"] = (Func<string, string>)LuaSpawnObject;
         unityTable["SetPosition"] = (Action<string, float, float, float>)LuaSetPosition;
         unityTable["SetScale"] = (Action<string, float, float, float>)LuaSetScale;
+        unityTable["SetColor"] = (Action<string, float, float, float>)LuaSetColor;
 
         // Mobile Touch Input Bindings
         unityTable["GetTouchX"] = (Func<float>)LuaGetTouchX;
@@ -135,22 +142,18 @@ public class MoonSharpOTAManager : MonoBehaviour
         return freshScript;
     }
 
-    private void LoadSavedScriptFromDevice()
+    private bool LoadSavedScriptFromDevice()
     {
         if (File.Exists(deviceSavePath))
         {
             try
             {
                 string savedCode = File.ReadAllText(deviceSavePath);
-                if (!string.IsNullOrEmpty(savedCode) && !savedCode.Contains("<!DOCTYPE html>") && !savedCode.Contains("<html"))
+                if (!string.IsNullOrEmpty(savedCode))
                 {
                     currentLoadedScript = savedCode;
                     ExecuteLuaScript(savedCode);
-                }
-                else
-                {
-                    Debug.LogWarning("⚠ [Local Save] Cached script contains HTML or is invalid. Purging.");
-                    File.Delete(deviceSavePath);
+                    return true;
                 }
             }
             catch (Exception ex)
@@ -158,82 +161,7 @@ public class MoonSharpOTAManager : MonoBehaviour
                 Debug.LogError($"[Local Save Error]: {ex.Message}");
             }
         }
-    }
-
-    /// <summary>
-    /// Call this right after a successful /generate POST so the game doesn't have
-    /// to wait for the next scheduled poll to pick up the new script.
-    /// </summary>
-    public void RequestImmediateRefresh()
-    {
-        StartCoroutine(FetchOnce());
-    }
-
-    private IEnumerator FetchOnce()
-    {
-        using (UnityWebRequest www = UnityWebRequest.Get(PollUrlWithDeviceId()))
-        {
-            www.SetRequestHeader("ngrok-skip-browser-warning", "true");
-            yield return www.SendWebRequest();
-
-            if (www.result == UnityWebRequest.Result.Success)
-            {
-                string incomingLuaCode = www.downloadHandler.text.Trim();
-                if (!string.IsNullOrEmpty(incomingLuaCode) &&
-                    incomingLuaCode != currentLoadedScript &&
-                    !incomingLuaCode.Contains("<!DOCTYPE html>") &&
-                    !incomingLuaCode.Contains("<html"))
-                {
-                    Debug.Log("🔄 [OTA] Immediate refresh fetched new script!");
-                    currentLoadedScript = incomingLuaCode;
-                    SaveScriptToDevice(incomingLuaCode);
-                    ExecuteLuaScript(incomingLuaCode);
-                }
-            }
-            else
-            {
-                Debug.LogWarning($"⚠ [OTA] Immediate refresh failed: {www.error}");
-            }
-        }
-    }
-
-    private IEnumerator PollForOTAUpdates()
-    {
-        while (true)
-        {
-            yield return new WaitForSeconds(pollInterval);
-
-            using (UnityWebRequest www = UnityWebRequest.Get(PollUrlWithDeviceId()))
-            {
-                www.SetRequestHeader("ngrok-skip-browser-warning", "true");
-                yield return www.SendWebRequest();
-
-                if (www.result == UnityWebRequest.Result.Success)
-                {
-                    string incomingLuaCode = www.downloadHandler.text.Trim();
-
-                    // Ensure response is valid and does not contain ngrok/HTML error screens
-                    if (!string.IsNullOrEmpty(incomingLuaCode) &&
-                        incomingLuaCode != currentLoadedScript &&
-                        !incomingLuaCode.Contains("<!DOCTYPE html>") &&
-                        !incomingLuaCode.Contains("<html"))
-                    {
-                        Debug.Log("🔄 [OTA] New valid Lua script received!");
-                        currentLoadedScript = incomingLuaCode;
-                        SaveScriptToDevice(incomingLuaCode);
-                        ExecuteLuaScript(incomingLuaCode);
-                    }
-                    else if (incomingLuaCode.Contains("<!DOCTYPE html>") || incomingLuaCode.Contains("<html"))
-                    {
-                        Debug.LogWarning("⚠ [OTA Warning] Server returned an HTML page instead of Lua code. Ignored.");
-                    }
-                }
-                else
-                {
-                    Debug.LogWarning($"⚠ [OTA] Poll failed: {www.error}");
-                }
-            }
-        }
+        return false;
     }
 
     private void SaveScriptToDevice(string code)
@@ -248,8 +176,6 @@ public class MoonSharpOTAManager : MonoBehaviour
         {
             ClearSpawnedObjects();
             luaScript = CreateFreshLuaEngine();
-
-            Debug.Log($"🔍 [Lua Payload Inspection]:\n{code}");
 
             luaScript.DoString(code);
 
@@ -306,7 +232,7 @@ public class MoonSharpOTAManager : MonoBehaviour
     }
 
     // ---------------------------------------------------------------
-    // Lua-bound functions (must match server.js SYSTEM_PROMPT exactly)
+    // Lua-bound functions (must match AIRequestClient.cs SYSTEM_PROMPT exactly)
     // ---------------------------------------------------------------
 
     private void LuaDebugLog(string message)
@@ -386,6 +312,20 @@ public class MoonSharpOTAManager : MonoBehaviour
         go.transform.localScale = new Vector3(x, y, z);
     }
 
+    private void LuaSetColor(string id, float r, float g, float b)
+    {
+        if (string.IsNullOrEmpty(id) || !spawnedObjects.TryGetValue(id, out GameObject go) || go == null)
+        {
+            Debug.LogWarning($"⚠ [Lua] SetColor called with unknown id '{id}'.");
+            return;
+        }
+        Renderer rend = go.GetComponent<Renderer>();
+        if (rend != null)
+        {
+            rend.material.color = new Color(Mathf.Clamp01(r), Mathf.Clamp01(g), Mathf.Clamp01(b), 1f);
+        }
+    }
+
     private float LuaGetTouchX()
     {
         if (targetCamera == null)
@@ -413,13 +353,11 @@ public class MoonSharpOTAManager : MonoBehaviour
 
     private bool LuaIsTouching()
     {
-        // Real touchscreen (device)
-        if (Touchscreen.current != null && Touchscreen.current.primaryTouch.press.isPressed)
+        if (UnityEngine.InputSystem.Touchscreen.current != null && UnityEngine.InputSystem.Touchscreen.current.primaryTouch.press.isPressed)
         {
             return true;
         }
-        // Mouse fallback (Editor / desktop testing)
-        if (Mouse.current != null && Mouse.current.leftButton.isPressed)
+        if (UnityEngine.InputSystem.Mouse.current != null && UnityEngine.InputSystem.Mouse.current.leftButton.isPressed)
         {
             return true;
         }
@@ -428,13 +366,13 @@ public class MoonSharpOTAManager : MonoBehaviour
 
     private Vector2 GetPointerScreenPosition()
     {
-        if (Touchscreen.current != null && Touchscreen.current.primaryTouch.press.isPressed)
+        if (UnityEngine.InputSystem.Touchscreen.current != null && UnityEngine.InputSystem.Touchscreen.current.primaryTouch.press.isPressed)
         {
-            return Touchscreen.current.primaryTouch.position.ReadValue();
+            return UnityEngine.InputSystem.Touchscreen.current.primaryTouch.position.ReadValue();
         }
-        if (Mouse.current != null)
+        if (UnityEngine.InputSystem.Mouse.current != null)
         {
-            return Mouse.current.position.ReadValue();
+            return UnityEngine.InputSystem.Mouse.current.position.ReadValue();
         }
         return Vector2.zero;
     }
