@@ -18,6 +18,10 @@ public class MoonSharpOTAManager : MonoBehaviour
     [Tooltip("Used ONLY when this device has never cached or generated a script of its own (e.g. very first launch with no network / before any prompt has been submitted).")]
     [SerializeField] private TextAsset bundledFallbackScript;
 
+    [Header("Rendering")]
+    [Tooltip("Assign a real Material asset here (URP Lit or Standard, matching your project's pipeline). Direct references survive shader stripping in builds; Shader.Find at runtime does not.")]
+    [SerializeField] private Material defaultObjectMaterial;
+
     private Script luaScript;
     private string deviceSavePath;
     private string currentLoadedScript = "";
@@ -272,17 +276,26 @@ public class MoonSharpOTAManager : MonoBehaviour
 
         GameObject go = GameObject.CreatePrimitive(primitive);
 
-        // IMPORTANT: CreatePrimitive assigns the legacy built-in "Default-Diffuse" shader.
-        // Under URP/HDRP that renders invisible/pink. Explicitly assign a pipeline-safe material.
+        // IMPORTANT: CreatePrimitive assigns the legacy built-in "Default-Diffuse" shader,
+        // which renders as invisible/pink under URP/HDRP. Prefer a real assigned Material
+        // (survives build shader-stripping) and only fall back to Shader.Find if none was set.
         Renderer rend = go.GetComponent<Renderer>();
         if (rend != null)
         {
-            Shader urpLit = Shader.Find("Universal Render Pipeline/Lit");
-            Shader standard = Shader.Find("Standard");
-            Shader shaderToUse = urpLit != null ? urpLit : standard;
-            if (shaderToUse != null)
+            if (defaultObjectMaterial != null)
             {
-                rend.material = new Material(shaderToUse);
+                rend.material = defaultObjectMaterial;
+            }
+            else
+            {
+                Shader urpLit = Shader.Find("Universal Render Pipeline/Lit");
+                Shader standard = Shader.Find("Standard");
+                Shader shaderToUse = urpLit != null ? urpLit : standard;
+                if (shaderToUse != null)
+                {
+                    rend.material = new Material(shaderToUse);
+                }
+                Debug.LogWarning("⚠ [Lua] No defaultObjectMaterial assigned — falling back to Shader.Find, which can be stripped from builds. Assign a Material in the Inspector to avoid pink objects on-device.");
             }
         }
 

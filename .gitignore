@@ -60,3 +60,8 @@
 *.asset
 *.asset
 /Temp
+/.utmp/RelWithDebInfo/65v6p5k4/arm64-v8a/GameActivity/CMakeFiles/game.dir
+/.utmp/RelWithDebInfo/65v6p5k4/arm64-v8a/CMakeFiles/3.22.1-g37088a8-dirty
+/.utmp/RelWithDebInfo/65v6p5k4/arm64-v8a
+/.utmp/RelWithDebInfo/65v6p5k4/prefab/arm64-v8a/prefab/lib/aarch64-linux-android/cmake/game-activity
+/.utmp
